@@ -66,6 +66,10 @@ public class MainActivity extends Activity {
     private MarketCandleChartView mainChart;
     private String chartFrame = "15";
     private final Map<String, Double> dayChanges = new HashMap<>();
+    private final Map<String, Double> tickerPrices = new HashMap<>();
+    private TextView entryGuideView, guideUpdatedView;
+    private String strategyMode = "SCALP";
+    private long lastGuideCompute = 0;
     private final Map<String, Double> turnovers = new HashMap<>();
     private final Map<String, Double> volumes = new HashMap<>();
     private final Map<String, Double> dayRanges = new HashMap<>();
@@ -83,7 +87,7 @@ public class MainActivity extends Activity {
     private double lastPrice = Double.NaN, bidTotal = Double.NaN, askTotal = Double.NaN;
     private long lastFeedAt = 0;
     private boolean closed = false;
-    private static final String[] FRAMES = {"5", "15", "60"};
+    private static final String[] FRAMES = {"1", "3", "5", "15", "60"};
     private static final int GREEN = Color.rgb(68, 220, 157), RED = Color.rgb(248, 104, 116);
     private static class Candle {
         long start;
@@ -110,11 +114,18 @@ public class MainActivity extends Activity {
                 if (closed) return;
                 // 연결 중단 시 일부 비기본 주기를 보충 조회합니다.
                 if (!chartFrame.equals("5") && !chartFrame.equals("15") && !chartFrame.equals("60") && System.currentTimeMillis()-lastFeedAt>90000) loadChartFrame();
-                if (++passes % 2 == 0) loadAllTickerChanges();
+                // Sidebar ticker polling runs separately every 15 seconds.
                 if (passes % 10 == 0) loadNewsPreview();
                 chartHandler.postDelayed(this, 30000);
             }
         }, 30000);
+        ui.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (closed) return;
+                loadAllTickerChanges();
+                ui.postDelayed(this, 15000);
+            }
+        }, 15000);
         ui.postDelayed(new Runnable() {
             @Override public void run() {
                 if (closed) return;
@@ -173,7 +184,7 @@ public class MainActivity extends Activity {
         ScrollView screen=new ScrollView(this);screen.setFillViewport(true);screen.setBackgroundColor(BG);
         LinearLayout root=column();root.setPadding(dp(9),dp(8),dp(9),dp(12));screen.addView(root);
         LinearLayout top=row();top.setGravity(Gravity.CENTER_VERTICAL);
-        TextView title=styled("◈  BYBIT FUTURES PREMIUM v2.7  ✦ HYBRID AI",wide?18:17,Color.WHITE,true);
+        TextView title=styled("◈  BYBIT FUTURES PREMIUM v2.8  ✦ AI TRADING PRO",wide?18:17,Color.WHITE,true);
         top.addView(title,new LinearLayout.LayoutParams(0,-2,1));
         top.addView(button("⟳ 새로고침",()->reconnect()));
         top.addView(button("설정 / 업데이트",()->checkUpdate()));root.addView(top);
@@ -226,7 +237,14 @@ public class MainActivity extends Activity {
         planSummary=styled("실제 가격 구간은 [차트 분석]에서 계산합니다.\n진입·지지·저항·TP1·TP2·손절·순손익비 제공",13,MUTED,false);
         trades.addView(planSummary);
         trades.addView(button("차트 분석으로 목표가 · 손절 · 손익비 계산",()->startTradePlan()));
-        right.addView(styled("✦  AI 종합 판단 · LONG / SHORT / WAIT",15,Color.WHITE,true));
+        right.addView(styled("✦  AI 실시간 매매 가이드",15,Color.WHITE,true));
+        LinearLayout modeRow=row();
+        modeRow.addView(button("⚡ 초단타 1·3·5분",()->{strategyMode="SCALP";render();}),new LinearLayout.LayoutParams(0,-2,1));
+        modeRow.addView(button("▤ 단타 5·15·60분",()->{strategyMode="DAY";render();}),new LinearLayout.LayoutParams(0,-2,1));
+        right.addView(modeRow);
+        entryGuideView=styled("진입 가격 분석 준비 중…",13,Color.WHITE,true);right.addView(entryGuideView);
+        guideUpdatedView=styled("마지막 분석: --",10,MUTED,false);right.addView(guideUpdatedView);
+        right.addView(styled("✦  다중 시간봉 LONG / SHORT / WAIT",14,Color.WHITE,true));
         signalView=styled("●  WAIT · 분석 준비 중",23,Color.YELLOW,true);right.addView(signalView);
         scoreDescription=styled("지표 점수는 승률이 아닙니다",11,MUTED,false);right.addView(scoreDescription);
         right.addView(button("▾  점수 산출 기준 · 상세 보기",()->showScoreDetails()));
@@ -308,7 +326,9 @@ public class MainActivity extends Activity {
             ImageView logo=new ImageView(this);logo.setImageResource(coinLogo(item));
             LinearLayout.LayoutParams logoLp=new LinearLayout.LayoutParams(dp(29),dp(29));logoLp.rightMargin=dp(7);
             entry.addView(logo,logoLp);
-            TextView ticker=styled(item.replace("USDT", "")+" / USDT",12,Color.WHITE,item.equals(symbol));
+            Double tickPrice=tickerPrices.get("linear:"+item);
+            String priceText=tickPrice==null?"--":String.format(Locale.US,"%,.4f",tickPrice);
+            TextView ticker=styled(item.replace("USDT", "")+" / USDT\n$"+priceText,12,Color.WHITE,item.equals(symbol));
             entry.addView(ticker,new LinearLayout.LayoutParams(0,-2,1));
             TextView change=styled(formatted,11,ch==null?MUTED:ch>=0?GREEN:RED,true);
             entry.addView(change);
@@ -405,7 +425,7 @@ public class MainActivity extends Activity {
     }
     private void loadAllTickerChanges() {
         worker.execute(() -> {
-            Map<String,Double> changes=new HashMap<>();
+            Map<String,Double> changes=new HashMap<>(), prices=new HashMap<>();
             Map<String,Double> amounts=new HashMap<>(), vols=new HashMap<>(), ranges=new HashMap<>();
             for (String market : new String[]{"linear","inverse"}) {
                 try (Response res=client.newCall(new Request.Builder().url("https://api.bybit.com/v5/market/tickers?category="+market).build()).execute()) {
@@ -417,6 +437,7 @@ public class MainActivity extends Activity {
                         JSONObject item=list.getJSONObject(i);
                         String symbol=item.optString("symbol");
                         String key=market+":"+symbol;
+                        try { prices.put(key,Double.parseDouble(item.optString("lastPrice","0"))); }catch(Exception ignored){}
                         try { amounts.put(key,Double.parseDouble(item.optString("turnover24h","0"))); }catch(Exception ignored){}
                         try { vols.put(key,Double.parseDouble(item.optString("volume24h","0"))); }catch(Exception ignored){}
                         try { double hi=Double.parseDouble(item.optString("highPrice24h","0"));double lo=Double.parseDouble(item.optString("lowPrice24h","0"));
@@ -430,6 +451,7 @@ public class MainActivity extends Activity {
             ui.post(() -> {
                 if (closed) return;
                 dayChanges.clear(); dayChanges.putAll(changes);
+                tickerPrices.clear(); tickerPrices.putAll(prices);
                 turnovers.clear();turnovers.putAll(amounts);volumes.clear();volumes.putAll(vols);dayRanges.clear();dayRanges.putAll(ranges);
                 showSelectedChange();refreshQuickSymbols();
             });
@@ -656,10 +678,10 @@ public class MainActivity extends Activity {
         Request request = new Request.Builder().url("wss://stream.bybit.com/v5/public/" + marketCategory).build();
         socket = client.newWebSocket(request, new WebSocketListener() {
             @Override public void onOpen(WebSocket ws, Response response) {
-                String extra = (chartFrame.equals("5") || chartFrame.equals("15") || chartFrame.equals("60")) ? "" : ",\"kline."+chartFrame+"."+marketSymbol+"\"";
+                String extra = (chartFrame.equals("1") || chartFrame.equals("3") || chartFrame.equals("5") || chartFrame.equals("15") || chartFrame.equals("60")) ? "" : ",\"kline."+chartFrame+"."+marketSymbol+"\"";
                 ws.send("{\"op\":\"subscribe\",\"args\":[\"tickers." + marketSymbol
                     + "\",\"orderbook.1." + marketSymbol + "\",\"kline.5." + marketSymbol
-                    + "\",\"kline.15." + marketSymbol + "\",\"kline.60." + marketSymbol + "\""+extra+"]}");
+                    + "\",\"kline.15." + marketSymbol + "\",\"kline.60." + marketSymbol + "\",\"kline.1." + marketSymbol + "\",\"kline.3." + marketSymbol + "\""+extra+"]}");
                 ui.post(() -> { if (!closed) statusView.setText("Bybit " + marketSymbol + " 실시간 연결됨"); });
             }
             @Override public void onMessage(WebSocket ws, String text) {
@@ -681,12 +703,16 @@ public class MainActivity extends Activity {
             lastFeedAt = System.currentTimeMillis();
             if (topic.startsWith("tickers.")) {
                 JSONObject data = event.getJSONObject("data");
-                if (data.has("lastPrice")) lastPrice = Double.parseDouble(data.getString("lastPrice"));
+                if (data.has("lastPrice")) {
+                    lastPrice = Double.parseDouble(data.getString("lastPrice"));
+                    tickerPrices.put(category+":"+symbol,lastPrice);
+                }
                 if (data.has("price24hPcnt")) {
                     double pct=100*Double.parseDouble(data.getString("price24hPcnt"));
                     dayChanges.put(category+":"+symbol,pct);
                     showSelectedChange();
                 }
+                refreshQuickSymbols();
             } else if (topic.startsWith("orderbook.")) {
                 JSONObject data = event.getJSONObject("data");
                 JSONArray bids = data.optJSONArray("b"), asks = data.optJSONArray("a");
@@ -765,6 +791,49 @@ public class MainActivity extends Activity {
         for(int i=0;i<n;i++){close[i]=b.get(i).close;volume[i]=b.get(i).volume;}
         return new ConsensusEngine.Frame(frame,close,volume);
     }
+    /** Informational, condition-based levels. No automatic order placement. */
+    private void renderEntryGuide() {
+        if (entryGuideView==null || guideUpdatedView==null) return;
+        boolean stale=lastFeedAt==0 || System.currentTimeMillis()-lastFeedAt>30000;
+        String[] frames=strategyMode.equals("SCALP")?new String[]{"1","3","5"}:new String[]{"5","15","60"};
+        // Scalp candles are subscribed separately so an absent frame must produce WAIT.
+        Snapshot a=snapshot(frames[0]),b=snapshot(frames[1]),c=snapshot(frames[2]);
+        if (stale || a==null || b==null || c==null || !Double.isFinite(lastPrice) || lastPrice<=0) {
+            entryGuideView.setText("WAIT · 관망\n"+(stale?"시세 연결 지연":"분석에 필요한 시간봉 데이터 수집 중")+"\n진입 가격 추천 보류");
+            entryGuideView.setTextColor(Color.YELLOW);
+            return;
+        }
+        int score=a.bias*5+b.bias*4+c.bias*3;
+        int side=score>=12?1:score<=-12?-1:0;
+        ArrayList<Candle> candles=bars.get(frames[0]);
+        if (candles==null || candles.size()<30 || side==0) {
+            entryGuideView.setText("WAIT · 관망\n추세 신호가 충분히 일치하지 않습니다.\n점수 "+score+"/36");
+            entryGuideView.setTextColor(Color.YELLOW);
+            return;
+        }
+        int n=candles.size()-1;
+        double range=0;
+        for(int i=n-14;i<n;i++) {
+            Candle x=candles.get(i), prev=candles.get(i-1);
+            range+=Math.max(x.high-x.low,Math.max(Math.abs(x.high-prev.close),Math.abs(x.low-prev.close)));
+        }
+        double atr=range/14.0;
+        if(!Double.isFinite(atr) || atr<=0) {entryGuideView.setText("WAIT · 변동성 계산 불가");return;}
+        double near=lastPrice-side*0.35*atr,far=lastPrice-side*0.75*atr;
+        double low=Math.min(near,far),high=Math.max(near,far);
+        double midpoint=(low+high)/2;
+        double sl=midpoint-side*1.4*atr,tp1=midpoint+side*2.1*atr,tp2=midpoint+side*3.0*atr;
+        boolean inZone=lastPrice>=low && lastPrice<=high;
+        String sideText=side>0?"LONG":"SHORT";
+        String state=inZone?"진입 후보 구간 · 추가 확인 필요":"추천 구간 대기";
+        entryGuideView.setText(String.format(Locale.US,
+            "%s · %s\n추천 진입 구간 $%,.4f ~ $%,.4f\n손절 SL $%,.4f\n목표 TP1 $%,.4f · TP2 $%,.4f\n예상 손익비 1:1.5 / 1:2.1 · 점수 %+d/36\n조건: 추세 유지·구간 도달·캔들 확인\n무효: 손절선 이탈 또는 신호 반전",
+            sideText,state,low,high,sl,tp1,tp2,score));
+        entryGuideView.setTextColor(side>0?GREEN:RED);
+        lastGuideCompute=System.currentTimeMillis();
+        guideUpdatedView.setText("최근 평가: "+new java.text.SimpleDateFormat("HH:mm:ss",Locale.KOREA).format(new java.util.Date(lastGuideCompute))
+            +" · "+(strategyMode.equals("SCALP")?"초단타":"단타")+" · 추정 구간/실제 주문 아님");
+    }
     private void render() {
         if (!Double.isNaN(lastPrice)) priceView.setText(String.format(Locale.US,"$%,.2f",lastPrice));
         Snapshot s5=snapshot("5"), s15=snapshot("15"), s60=snapshot("60");
@@ -779,6 +848,7 @@ public class MainActivity extends Activity {
                 "5분봉: %s · RSI %.1f · EMA9 %.0f / EMA21 %.0f\n15분봉: %s · RSI %.1f\n1시간봉: %s · RSI %.1f\n5분봉 MACD %.2f / Signal %.2f",
                 s5.text,s5.rsi,s5.ema9,s5.ema21,s15.text,s15.rsi,s60.text,s60.rsi,s5.macd,s5.macdSignal));
         }
+        renderEntryGuide();
         if(consensusView!=null) {
             boolean stale=lastFeedAt==0 || System.currentTimeMillis()-lastFeedAt>30000;
             boolean newsCaution=latestMacroHeadline>0 && System.currentTimeMillis()-latestMacroHeadline<90*60*1000L;

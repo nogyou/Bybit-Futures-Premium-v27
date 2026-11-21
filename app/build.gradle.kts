@@ -6,8 +6,8 @@ android {
         applicationId = "com.btc.analyzer"
         minSdk = 26
         targetSdk = 35
-        versionCode = 11
-        versionName = "2.7.0-hybrid-beta"
+        versionCode = 12
+        versionName = "2.8.0-dev1"
     }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
 }
